@@ -124,21 +124,43 @@ async fn handle_packet(
                     let restart_crypt = match err {
                         DecryptError::Late => {
                             let late = { client.crypt_state.lock().await.late };
-
-                            late > 100
+                            // Reduced threshold from 100 to 15 for faster recovery
+                            late > 15
                         }
-                        DecryptError::Repeat => false,
+                        DecryptError::Repeat => {
+                            let repeat_count = { client.crypt_state.lock().await.lost };
+                            // Reset if we get too many repeat errors (indicates desync)
+                            repeat_count > 5
+                        },
+                        DecryptError::Mac => {
+                            // Always reset immediately on MAC errors as they indicate crypto desync
+                            tracing::warn!("MAC error for client {}, forcing immediate crypt reset", client);
+                            true
+                        },
                         _ => true,
                     };
 
-                    // if we haven't gotten a good packet for 5 seconds then we should reset the clients crypt
-                    let restart_crypt = restart_crypt || Instant::now().duration_since(last_good).as_secs() > 5;
+                    // Reduced timeout from 5 seconds to 2 seconds for faster recovery
+                    let restart_crypt = restart_crypt || Instant::now().duration_since(last_good).as_secs() > 2;
 
                     if restart_crypt {
-                        tracing::error!("client {} udp decrypt error: {}, reset crypt setup", client, err);
+                        // Check if we should allow reset based on exponential backoff
+                        let should_reset = {
+                            let crypt_state = client.crypt_state.lock().await;
+                            crypt_state.should_allow_reset()
+                        };
+                        
+                        if should_reset {
+                            tracing::error!("client {} udp decrypt error: {}, reset crypt setup (late: {}, last_good: {}s ago)", 
+                                           client, err, 
+                                           { client.crypt_state.lock().await.late },
+                                           Instant::now().duration_since(last_good).as_secs());
 
-                        if let Err(e) = state.reset_client_crypt(&client).await {
-                            tracing::error!("failed to send crypt setup: {:?}", e);
+                            if let Err(e) = state.reset_client_crypt(&client).await {
+                                tracing::error!("failed to send crypt setup: {:?}", e);
+                            }
+                        } else {
+                            tracing::debug!("Skipping crypt reset for client {} due to exponential backoff", client);
                         }
                     }
 

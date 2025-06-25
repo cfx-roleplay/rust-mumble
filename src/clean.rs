@@ -60,9 +60,25 @@ async fn clean_run(state: &ServerState) -> Result<(), MumbleError> {
             }
 
             let last_good = { client.crypt_state.lock().await.last_good };
+            let (late_count, lost_count, resync_count, should_allow_reset) = { 
+                let crypt = client.crypt_state.lock().await;
+                (crypt.late, crypt.lost, crypt.resync, crypt.should_allow_reset())
+            };
 
-            if now.duration_since(last_good).as_millis() > 8000 {
+            // Reduced timeout from 8 seconds to 5 seconds for faster recovery
+            let should_reset_crypt = should_allow_reset && (
+                now.duration_since(last_good).as_millis() > 5000
+                || late_count > 20  // Reset if too many late packets
+                || lost_count > 50  // Reset if too many lost packets  
+                || resync_count > 10 // Reset if too many resyncs (indicates persistent issues)
+            );
+
+            if should_reset_crypt {
+                tracing::warn!("Scheduling crypt reset for client {}: last_good={}ms ago, late={}, lost={}, resync={}", 
+                              client, now.duration_since(last_good).as_millis(), late_count, lost_count, resync_count);
                 clients_to_reset_crypt.push(Arc::clone(client))
+            } else if !should_allow_reset {
+                tracing::debug!("Skipping crypt reset for client {} due to exponential backoff", client);
             }
 
             iter = client_iter.next_async().await;

@@ -34,6 +34,10 @@ pub struct CryptState {
     pub remote_good: u32,
     pub remote_lost: u32,
     pub remote_resync: u32,
+    
+    // Reset tracking for exponential backoff
+    pub reset_attempts: u32,
+    pub last_reset: Instant,
 }
 
 impl Default for CryptState {
@@ -57,13 +61,23 @@ impl Default for CryptState {
             remote_late: 0,
             remote_good: 0,
             remote_lost: 0,
-            remote_resync: 0
+            remote_resync: 0,
+            
+            // Reset tracking for exponential backoff
+            reset_attempts: 0,
+            last_reset: Instant::now(),
         }
     }
 }
 
 impl CryptState {
     pub fn reset(&mut self) {
+        tracing::info!("Resetting crypt state - good: {}, late: {}, lost: {}, resync: {}", 
+                      self.good, self.late, self.lost, self.resync);
+        
+        // Track crypt reset metric
+        crate::metrics::CRYPT_RESETS_TOTAL.inc();
+        
         self.encrypt_nonce = 0;
         self.decrypt_nonce = 1 << 127;
         self.decrypt_history = [0; 0x100];
@@ -72,6 +86,35 @@ impl CryptState {
         self.lost = 0;
         self.resync = 0;
         self.last_good = Instant::now();
+        
+        // Also reset remote stats to ensure clean slate
+        self.remote_late = 0;
+        self.remote_good = 0;
+        self.remote_lost = 0;
+        self.remote_resync = 0;
+        
+        // Update reset tracking
+        self.reset_attempts += 1;
+        self.last_reset = Instant::now();
+    }
+
+    /// Check if a reset should be allowed based on exponential backoff
+    pub fn should_allow_reset(&self) -> bool {
+        let now = Instant::now();
+        let time_since_last_reset = now.duration_since(self.last_reset);
+        
+        // Exponential backoff: 1s, 2s, 4s, 8s, max 30s
+        let min_interval = std::cmp::min(1000 * (1 << self.reset_attempts), 30000);
+        
+        time_since_last_reset.as_millis() > min_interval as u128
+    }
+    
+    /// Reset the reset attempt counter on successful operation
+    pub fn reset_attempt_counter(&mut self) {
+        if self.reset_attempts > 0 {
+            tracing::info!("Resetting attempt counter after successful operation");
+            self.reset_attempts = 0;
+        }
     }
 
     /// Returns the nonce used for encrypting.
@@ -85,8 +128,15 @@ impl CryptState {
     }
 
     pub fn set_decrypt_nonce(&mut self, nonce: &[u8]) {
+        let old_nonce = self.decrypt_nonce;
         self.decrypt_nonce = u128::from_le_bytes(nonce.try_into().unwrap());
         self.resync += 1;
+        
+        // Clear history buffer on resync to prevent false positives
+        self.decrypt_history = [0; 0x100];
+        
+        tracing::info!("Crypt resync: old nonce: {}, new nonce: {}, resync count: {}", 
+                      old_nonce, self.decrypt_nonce, self.resync);
     }
 
     pub fn get_crypt_setup(&self) -> CryptSetup {
@@ -130,28 +180,71 @@ impl CryptState {
         let mut late = false; // will always restore nonce if this is the case
         let mut lost = 0; // for stats only
 
-        if self.decrypt_nonce.wrapping_add(1) as u8 == nonce_0 {
-            // in order
+        // Use 16 bits for better nonce comparison instead of just 8 bits
+        let expected_nonce_low16 = (self.decrypt_nonce.wrapping_add(1) & 0xFFFF) as u16;
+        let received_nonce_low16 = (nonce_0 as u16) | ((self.decrypt_nonce & 0xFF00) as u16);
+        
+        // Check if this is the expected next packet using 16-bit comparison
+        if (self.decrypt_nonce.wrapping_add(1) as u8) == nonce_0 {
+            // Normal in-order packet
             self.decrypt_nonce = self.decrypt_nonce.wrapping_add(1);
         } else {
-            // packet is late or repeated, or we lost a few packets in between
-            let diff = nonce_0.wrapping_sub(self.decrypt_nonce as u8) as i8;
-            self.decrypt_nonce = self.decrypt_nonce.wrapping_add(diff as u128);
+            // Handle out-of-order, late, or wrapped packets
+            let nonce_diff = nonce_0.wrapping_sub(self.decrypt_nonce as u8) as i8;
+            
+            // Handle nonce wrap-around more carefully
+            let mut adjusted_diff = nonce_diff;
+            if nonce_diff > 127 {
+                // Likely a wrap-around in the negative direction
+                adjusted_diff = nonce_diff - 256;
+            } else if nonce_diff < -127 {
+                // Likely a wrap-around in the positive direction  
+                adjusted_diff = nonce_diff + 256;
+            }
+            
+            self.decrypt_nonce = self.decrypt_nonce.wrapping_add(adjusted_diff as u128);
 
-            if diff > 0 {
-                lost = i32::from(diff - 1); // lost a few packets in between this and the last one
-            } else if diff > -30 {
-                if self.decrypt_history[nonce_0 as usize] == (self.decrypt_nonce >> 8) as u8 {
+            if adjusted_diff > 0 {
+                lost = i32::from(adjusted_diff - 1); // lost packets between this and the last one
+                tracing::debug!("Lost {} packets, nonce diff: {}", lost, adjusted_diff);
+                
+                // Track lost packets metric
+                crate::metrics::LOST_PACKETS_TOTAL.inc_by(lost as u64);
+                
+                // Track nonce wraps when we jump significantly
+                if adjusted_diff > 100 {
+                    crate::metrics::NONCE_WRAPS_TOTAL.inc();
+                }
+            } else if adjusted_diff > -30 {
+                // Check for repeat packets using better history tracking
+                let history_index = nonce_0 as usize;
+                let expected_history = (self.decrypt_nonce >> 8) as u8;
+                
+                if self.decrypt_history[history_index] == expected_history {
                     self.decrypt_nonce = saved_nonce;
-
+                    tracing::debug!("Repeat packet detected, nonce: {}, history: {}", nonce_0, expected_history);
+                    
+                    // Track repeat error metric
+                    crate::metrics::CRYPT_ERRORS_TOTAL.with_label_values(&["repeat"]).inc();
+                    
                     return Err(DecryptError::Repeat);
                 }
                 // just late
                 late = true;
                 lost = -1;
+                tracing::debug!("Late packet, nonce diff: {}", adjusted_diff);
+                
+                // Track late packets metric
+                crate::metrics::LATE_PACKETS_TOTAL.inc();
             } else {
+                // Too late (more than 30 packets behind)
                 self.decrypt_nonce = saved_nonce;
-                return Err(DecryptError::Late); // late by more than 30 packets
+                tracing::warn!("Packet too late, nonce diff: {}, dropping", adjusted_diff);
+                
+                // Track late error metric
+                crate::metrics::CRYPT_ERRORS_TOTAL.with_label_values(&["too_late"]).inc();
+                
+                return Err(DecryptError::Late);
             }
         }
 
@@ -159,12 +252,20 @@ impl CryptState {
 
         if Ok(()) != ring::constant_time::verify_slices_are_equal(&header[1..4], &tag.to_be_bytes()[0..3]) {
             self.decrypt_nonce = saved_nonce;
+            tracing::warn!("MAC verification failed, nonce: {}, decrypt_nonce: {}", nonce_0, self.decrypt_nonce);
+            
+            // Track MAC error metric
+            crate::metrics::CRYPT_ERRORS_TOTAL.with_label_values(&["mac"]).inc();
+            
             return Err(DecryptError::Mac);
         }
 
         self.decrypt_history[nonce_0 as usize] = (self.decrypt_nonce >> 8) as u8;
         self.good += 1;
         self.last_good = Instant::now();
+        
+        // Reset attempt counter on successful decryption
+        self.reset_attempt_counter();
 
         if late {
             self.late += 1;
